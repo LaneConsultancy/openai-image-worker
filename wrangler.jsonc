@@ -5,5 +5,13 @@
   "kv_namespaces": [
     { "binding": "IMAGES", "id": "2cb1198291784da7851ebf38727cf938" }
   ],
+  "durable_objects": {
+    "bindings": [
+      { "name": "RENDER_JOB", "class_name": "RenderJob" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["RenderJob"] }
+  ],
   "observability": { "enabled": true }
 }

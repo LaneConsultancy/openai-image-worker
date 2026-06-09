@@ -28,16 +28,24 @@ const PROTOCOL_VERSION = '2024-11-05';
 
 const TOOLS = [{
   name: 'generate_image',
-  description: 'Generate an image from a text prompt using OpenAI gpt-image-2. Returns the image inline plus a 24h download URL you can curl into a repo. Use for hero images, illustrations, mockups, icons, social graphics, etc.',
+  description: 'Start generating an image with OpenAI gpt-image-2. Returns a job_id IMMEDIATELY without waiting for the render (this avoids the connector\'s 60s tool-call timeout, so HIGH and MEDIUM quality and large/landscape sizes all work). After calling this, call get_generated_image with the returned job_id, polling every ~15-20s until it returns the image (high quality can take 30-120s). Use high/medium quality freely.',
   inputSchema: {
     type: 'object',
     properties: {
       prompt: { type: 'string', description: 'Detailed description of the image to generate.' },
       size: { type: 'string', enum: ['1024x1024', '1536x1024', '1024x1536', 'auto'], description: '1536x1024=landscape, 1024x1536=portrait. Default 1024x1024.' },
-      quality: { type: 'string', enum: ['low', 'medium', 'high', 'auto'], description: 'Render quality. Default high.' },
+      quality: { type: 'string', enum: ['low', 'medium', 'high', 'auto'], description: 'Render quality. Default high. high/medium are fully supported (polling handles the longer render time).' },
       n: { type: 'integer', minimum: 1, maximum: 4, description: 'Number of images (default 1).' }
     },
     required: ['prompt']
+  }
+}, {
+  name: 'get_generated_image',
+  description: 'Retrieve the result of a generate_image job. Returns the image inline + a 24h download URL when ready; or {status: processing} (call again in ~15-20s); or an error. Poll this until the image is returned.',
+  inputSchema: {
+    type: 'object',
+    properties: { job_id: { type: 'string', description: 'The job_id returned by generate_image.' } },
+    required: ['job_id']
   }
 }];
 
@@ -110,32 +118,74 @@ async function generateImage(args, env, origin) {
   return { content };
 }
 
+// Durable Object that runs the slow render in an independent, durable context via an alarm,
+// so it survives well past the connector's 60s tool-call timeout.
+export class RenderJob {
+  constructor(state, env) { this.state = state; this.env = env; }
+  async fetch(request) {
+    const payload = await request.json();
+    await this.state.storage.put('payload', payload);
+    await this.state.storage.setAlarm(Date.now() + 100);
+    return new Response('queued');
+  }
+  async alarm() {
+    const p = await this.state.storage.get('payload');
+    if (!p) return;
+    await this.state.storage.delete('payload');
+    try {
+      const result = await generateImage(p.args, this.env, p.origin);
+      await this.env.IMAGES.put(`job:${p.jobId}`, JSON.stringify({ status: 'done', result }), { expirationTtl: 86400 });
+    } catch (e) {
+      await this.env.IMAGES.put(`job:${p.jobId}`, JSON.stringify({ status: 'error', error: e.message }), { expirationTtl: 3600 });
+    }
+  }
+}
+
 // ---------- MCP JSON-RPC ----------
-async function handleRpc(m, env, origin) {
+async function handleRpc(m, env, origin, ctx) {
   const { id, method, params } = m || {};
   switch (method) {
     case 'initialize':
-      return rpc(id, { protocolVersion: (params && params.protocolVersion) || PROTOCOL_VERSION, capabilities: { tools: {} }, serverInfo: { name: 'openai-image', version: '2.0.0' } });
+      return rpc(id, { protocolVersion: (params && params.protocolVersion) || PROTOCOL_VERSION, capabilities: { tools: {} }, serverInfo: { name: 'openai-image', version: '3.0.0' } });
     case 'notifications/initialized': case 'initialized': return null;
     case 'ping': return rpc(id, {});
     case 'tools/list': return rpc(id, { tools: TOOLS });
     case 'tools/call': {
       const name = params && params.name, args = (params && params.arguments) || {};
-      if (name !== 'generate_image') return rpc(id, toolText(`Unknown tool: ${name}`, true));
-      try { return rpc(id, await generateImage(args, env, origin)); }
-      catch (e) { return rpc(id, toolText(`Error: ${e.message}`, true)); }
+      if (name === 'generate_image') {
+        if (!(args.prompt || '').trim()) return rpc(id, toolText('prompt is required.', true));
+        if (args.sync) { try { return rpc(id, await generateImage(args, env, origin)); } catch (e) { return rpc(id, toolText(`Error: ${e.message}`, true)); } }
+        const jobId = crypto.randomUUID();
+        await env.IMAGES.put(`job:${jobId}`, JSON.stringify({ status: 'processing' }), { expirationTtl: 3600 });
+        // Hand the slow render to a Durable Object alarm (a durable, independent execution
+        // context) so it completes regardless of the connector's 60s tool-call timeout.
+        const stub = env.RENDER_JOB.get(env.RENDER_JOB.idFromName(jobId));
+        await stub.fetch('https://do/start', { method: 'POST', body: JSON.stringify({ jobId, args, origin }) });
+        return rpc(id, toolText(`Image generation started. job_id=${jobId}\nCall get_generated_image with this job_id, polling every ~15-20s until it returns the image (high quality can take 30-120s).`));
+      }
+      if (name === 'get_generated_image') {
+        const jid = (args.job_id || '').trim();
+        if (!jid) return rpc(id, toolText('job_id is required.', true));
+        const rec = await env.IMAGES.get(`job:${jid}`);
+        if (!rec) return rpc(id, toolText(`No job "${jid}" found (it may have expired). Start a new generate_image.`, true));
+        const job = JSON.parse(rec);
+        if (job.status === 'processing') return rpc(id, toolText('status: processing — not ready yet. Call get_generated_image again in ~15-20s.'));
+        if (job.status === 'error') return rpc(id, toolText(`Error: ${job.error}`, true));
+        return rpc(id, job.result);
+      }
+      return rpc(id, toolText(`Unknown tool: ${name}`, true));
     }
     default: return id != null ? rpcErr(id, -32601, `Method not found: ${method}`) : null;
   }
 }
-async function serveMcp(req, env, origin) {
+async function serveMcp(req, env, origin, ctx) {
   if (req.method !== 'POST') return new Response('Method Not Allowed', { status: 405 });
   let body; try { body = await req.json(); } catch { return j(rpcErr(null, -32700, 'Parse error'), 400); }
   if (Array.isArray(body)) {
-    const out = []; for (const m of body) { const r = await handleRpc(m, env, origin); if (r) out.push(r); }
+    const out = []; for (const m of body) { const r = await handleRpc(m, env, origin, ctx); if (r) out.push(r); }
     return out.length ? j(out) : new Response(null, { status: 202, headers: CORS });
   }
-  const r = await handleRpc(body, env, origin);
+  const r = await handleRpc(body, env, origin, ctx);
   return r ? j(r) : new Response(null, { status: 202, headers: CORS });
 }
 
@@ -257,7 +307,7 @@ async function handleOAuth(path, req, env, origin, url) {
 
 // ---------- router ----------
 export default {
-  async fetch(req, env) {
+  async fetch(req, env, ctx) {
     const url = new URL(req.url);
     const origin = url.origin;
     const path = url.pathname;
@@ -283,7 +333,7 @@ export default {
 
     // MCP via path-token (testing/power use)
     if (parts[0] === 'mcp' && parts[1] && env.MCP_TOKEN && parts[1] === env.MCP_TOKEN) {
-      return serveMcp(req, env, origin);
+      return serveMcp(req, env, origin, ctx);
     }
 
     // MCP via OAuth bearer (claude.ai)
@@ -297,7 +347,7 @@ export default {
           headers: { 'Content-Type': 'application/json', ...CORS, 'WWW-Authenticate': `Bearer resource_metadata="${origin}/.well-known/oauth-protected-resource"` }
         });
       }
-      return serveMcp(req, env, origin);
+      return serveMcp(req, env, origin, ctx);
     }
 
     return new Response('Not found', { status: 404 });
