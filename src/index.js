@@ -154,7 +154,6 @@ async function handleRpc(m, env, origin, ctx) {
       const name = params && params.name, args = (params && params.arguments) || {};
       if (name === 'generate_image') {
         if (!(args.prompt || '').trim()) return rpc(id, toolText('prompt is required.', true));
-        if (args.sync) { try { return rpc(id, await generateImage(args, env, origin)); } catch (e) { return rpc(id, toolText(`Error: ${e.message}`, true)); } }
         const jobId = crypto.randomUUID();
         await env.IMAGES.put(`job:${jobId}`, JSON.stringify({ status: 'processing' }), { expirationTtl: 3600 });
         // Hand the slow render to a Durable Object alarm (a durable, independent execution
