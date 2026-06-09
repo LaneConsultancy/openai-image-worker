@@ -1,0 +1,9 @@
+{
+  "name": "openai-image-mcp",
+  "main": "src/index.js",
+  "compatibility_date": "2024-11-01",
+  "kv_namespaces": [
+    { "binding": "IMAGES", "id": "2cb1198291784da7851ebf38727cf938" }
+  ],
+  "observability": { "enabled": true }
+}
